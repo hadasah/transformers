@@ -96,6 +96,10 @@ class T5Config(PretrainedConfig):
         pad_token_id=0,
         eos_token_id=1,
         gradient_checkpointing=False,
+        enc_prompt_length=None,
+        dec_prompt_length=None,
+        share_prompt=False,
+        trunc_from_end=False,
         **kwargs
     ):
         super().__init__(
@@ -120,6 +124,10 @@ class T5Config(PretrainedConfig):
         self.feed_forward_proj = feed_forward_proj
         self.use_cache = use_cache
         self.gradient_checkpointing = gradient_checkpointing
+        self.enc_prompt_length = enc_prompt_length
+        self.dec_prompt_length = dec_prompt_length
+        self.share_prompt = share_prompt
+        self.trunc_from_end = trunc_from_end
 
     @property
     def hidden_size(self):

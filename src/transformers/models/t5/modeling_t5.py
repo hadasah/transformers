@@ -23,6 +23,7 @@ import warnings
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch import Tensor
 from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
 
@@ -481,7 +482,6 @@ class T5Attention(nn.Module):
         scores = torch.matmul(
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
-
         if position_bias is None:
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
@@ -496,7 +496,6 @@ class T5Attention(nn.Module):
             # we want only the last query position bias
             if past_key_value is not None:
                 position_bias = position_bias[:, :, -int_seq_length:, :]
-
             if mask is not None:
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
 
@@ -790,11 +789,14 @@ class T5PreTrainedModel(PreTrainedModel):
 
 
 class T5Stack(T5PreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None, prompt=None, trunc_from_end=False, encoder_prompt_length=0):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
+        self.prompt = prompt
+        self.trunc_from_end = trunc_from_end
         self.is_decoder = config.is_decoder
+        self.encoder_prompt_length = encoder_prompt_length
 
         self.block = nn.ModuleList(
             [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
@@ -890,6 +892,15 @@ class T5Stack(T5PreTrainedModel):
             assert self.embed_tokens is not None, "You have to initialize the model with valid token embeddings"
             inputs_embeds = self.embed_tokens(input_ids)
 
+        if self.prompt is not None:
+            inputs_embeds = torch.cat((torch.stack(input_shape[0]*[self.prompt]), inputs_embeds), dim=1) #TODO fix trunc?
+            if self.trunc_from_end:
+                inputs_embeds = inputs_embeds[:,:input_shape[1],:]
+            else:
+                input_shape = inputs_embeds.size()[:-1]
+                if attention_mask is not None:
+                    attention_mask = torch.cat([torch.ones([input_shape[0], self.prompt.shape[0]]).to(inputs_embeds.device), attention_mask], dim=1)
+
         batch_size, seq_length = input_shape
 
         # required mask seq length can be calculated via length of past
@@ -919,8 +930,11 @@ class T5Stack(T5PreTrainedModel):
         if self.is_decoder and encoder_hidden_states is not None:
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            # import pdb;pdb.set_trace()
             if encoder_attention_mask is None:
                 encoder_attention_mask = torch.ones(encoder_hidden_shape, device=inputs_embeds.device)
+            if self.encoder_prompt_length:
+                encoder_attention_mask = torch.cat([torch.ones([encoder_batch_size, self.encoder_prompt_length]).to(inputs_embeds.device), encoder_attention_mask], dim=1)
             encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
         else:
             encoder_extended_attention_mask = None
@@ -934,9 +948,7 @@ class T5Stack(T5PreTrainedModel):
         all_cross_attentions = () if (output_attentions and self.is_decoder) else None
         position_bias = None
         encoder_decoder_position_bias = None
-
         hidden_states = self.dropout(inputs_embeds)
-
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
             layer_head_mask = head_mask[i]
             cross_attn_layer_head_mask = cross_attn_head_mask[i]
@@ -1241,20 +1253,37 @@ class T5Model(T5PreTrainedModel):
     def __init__(self, config: T5Config):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.encoder_prompt, self.decoder_prompt = None, None
+        if config.enc_prompt_length:
+            self.encoder_prompt = nn.Parameter(Tensor(config.enc_prompt_length, config.d_model))
+        if config.dec_prompt_length:
+            self.decoder_prompt = nn.Parameter(Tensor(config.dec_prompt_length, config.d_model))
+        if config.share_prompt:
+            self.decoder_prompt = self.encoder_prompt
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared, self.encoder_prompt, config.trunc_from_end)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = T5Stack(decoder_config, self.shared)
+        self.decoder = T5Stack(decoder_config, self.shared, self.decoder_prompt, config.trunc_from_end, config.enc_prompt_length)
 
         self.init_weights()
+
+        if self.encoder_prompt is not None or self.decoder_prompt is not None: 
+            for p in self.parameters():
+                p.requires_grad = False
+        if self.encoder_prompt is not None:
+            self.encoder_prompt.requires_grad_(True)
+            nn.init.uniform_(self.encoder_prompt, a=-0.5, b=0.5)
+        if self.decoder_prompt is not None:
+            self.decoder_prompt.requires_grad_(True)
+            nn.init.uniform_(self.decoder_prompt, a=-0.5, b=0.5)
 
         # Model parallel
         self.model_parallel = False
@@ -1428,22 +1457,40 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         self.model_dim = config.d_model
 
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.encoder_prompt, self.decoder_prompt = None, None
+        print(config)
+        if config.enc_prompt_length:
+            self.encoder_prompt = nn.Parameter(Tensor(config.enc_prompt_length, config.d_model))
+        if config.dec_prompt_length:
+            self.decoder_prompt = nn.Parameter(Tensor(config.dec_prompt_length, config.d_model))
+        if config.share_prompt:
+            self.decoder_prompt = self.encoder_prompt
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared, self.encoder_prompt, config.trunc_from_end)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = T5Stack(decoder_config, self.shared)
+        self.decoder = T5Stack(decoder_config, self.shared, self.decoder_prompt, config.trunc_from_end, config.enc_prompt_length)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.init_weights()
+
+        if self.encoder_prompt is not None or self.decoder_prompt is not None: 
+            for p in self.parameters():
+                p.requires_grad = False
+        if self.encoder_prompt is not None:
+            self.encoder_prompt.requires_grad_(True)
+            nn.init.uniform_(self.encoder_prompt, a=-0.5, b=0.5)
+        if self.decoder_prompt is not None:
+            self.decoder_prompt.requires_grad_(True)
+            nn.init.uniform_(self.decoder_prompt, a=-0.5, b=0.5)
 
         # Model parallel
         self.model_parallel = False
@@ -1538,6 +1585,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             >>> input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you ", return_tensors="pt").input_ids  # Batch size 1
             >>> outputs = model.generate(input_ids)
         """
+        import pdb;pdb.set_trace()
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1612,6 +1660,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         )
 
         sequence_output = decoder_outputs[0]
+        if self.decoder_prompt is not None:
+            sequence_output = sequence_output[:,self.decoder_prompt.shape[0]:,:]
 
         # Set device for model parallelism
         if self.model_parallel:
@@ -1704,13 +1754,21 @@ class T5EncoderModel(T5PreTrainedModel):
     def __init__(self, config: T5Config):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
-
+        self.encoder_prompt, self.decoder_prompt
+        if config.enc_prompt_length:
+            self.encoder_prompt = nn.Parameter(Tensor(config.enc_prompt_length, config.d_model))
+        
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared, self.encoder_prompt, config.trunc_from_end)
 
         self.init_weights()
+
+        if self.encoder_prompt is not None: 
+            for p in self.parameters():
+                p.requires_grad = False
+            self.encoder_prompt.requires_grad_(True)
 
         # Model parallel
         self.model_parallel = False
